@@ -6,11 +6,6 @@ on:
       - dcc-zero-cost-browser-probe
     paths:
       - '.github/workflows/dcc-zero-cost-browser-probe.yml'
-  pull_request:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/dcc-zero-cost-browser-probe.yml'
   workflow_dispatch:
 
 permissions:
@@ -149,16 +144,42 @@ jobs:
             >"$LOG" 2>&1 &
 
           chrome_pid=$!
-          chrome_pgid="$(ps -o pgid= -p "$chrome_pid" | tr -d '[:space:]')"
-          chrome_sid="$(ps -o sid= -p "$chrome_pid" | tr -d '[:space:]')"
-
-          case "$chrome_pgid" in ''|*[!0-9]*) echo "DCC_EXTERNAL_PROBE_FAIL PGID_UNKNOWN"; exit 2;; esac
-          case "$chrome_sid" in ''|*[!0-9]*) echo "DCC_EXTERNAL_PROBE_FAIL SID_UNKNOWN"; exit 2;; esac
-
-          echo "DCC_EXTERNAL_PROCESS_BOUNDARY pgid=$chrome_pgid sid=$chrome_sid"
-          sleep 8
+          sleep 2
 
           SELF_UID="$(id -u)"
+          chrome_sid=""
+          chrome_root_pid=""
+
+          for status_path in /proc/[0-9]*/status; do
+            [ -r "$status_path" ] || continue
+            pid="${status_path#/proc/}"
+            pid="${pid%/status}"
+            uid="$(awk '/^Uid:/{print $2; exit}' "$status_path" 2>/dev/null || true)"
+            [ "$uid" = "$SELF_UID" ] || continue
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+            case "$cmdline" in
+              *"--user-data-dir=$PROFILE"*)
+                case "$cmdline" in *"--type="*) continue ;; esac
+                ;;
+              *) continue ;;
+            esac
+            candidate_sid="$(ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+            case "$candidate_sid" in ''|*[!0-9]*) continue ;; esac
+            chrome_root_pid="$pid"
+            chrome_sid="$candidate_sid"
+            break
+          done
+
+          [ -n "$chrome_sid" ] || {
+            echo "DCC_EXTERNAL_BROWSER_LOG_BEGIN"
+            grep -aE 'sandbox|Sandbox|FATAL|ERROR|Error|error|namespace|DISPLAY|zygote' "$LOG" | tail -n 80 || true
+            echo "DCC_EXTERNAL_BROWSER_LOG_END"
+            echo "DCC_EXTERNAL_PROBE_FAIL BROWSER_ROOT_NOT_FOUND"
+            exit 3
+          }
+
+          echo "DCC_EXTERNAL_PROCESS_BOUNDARY root_pid=$chrome_root_pid sid=$chrome_sid"
+          sleep 6
           total=0
           good_seccomp=0
           good_nnp=0
@@ -172,9 +193,7 @@ jobs:
             uid="$(awk '/^Uid:/{print $2; exit}' "$status_path" 2>/dev/null || true)"
             [ "$uid" = "$SELF_UID" ] || continue
 
-            proc_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
             proc_sid="$(ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
-            [ "$proc_pgid" = "$chrome_pgid" ] || continue
             [ "$proc_sid" = "$chrome_sid" ] || continue
 
             cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"

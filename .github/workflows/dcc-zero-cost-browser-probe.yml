@@ -1,0 +1,160 @@
+name: DCC zero-cost browser sandbox probe
+
+on:
+  push:
+    branches:
+      - dcc-zero-cost-browser-probe
+    paths:
+      - '.github/workflows/dcc-zero-cost-browser-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  neutral-browser-sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Prove native Chrome sandbox on ephemeral hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          echo "DCC_EXTERNAL_PROBE_BEGIN"
+
+          CHROME=""
+          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              CHROME="$(command -v "$candidate")"
+              break
+            fi
+          done
+
+          if [ -z "$CHROME" ]; then
+            echo "DCC_EXTERNAL_PROBE_FAIL CHROME_MISSING"
+            exit 2
+          fi
+
+          if ! command -v Xvfb >/dev/null 2>&1; then
+            echo "DCC_EXTERNAL_PROBE_FAIL XVFB_MISSING"
+            exit 2
+          fi
+
+          echo "DCC_EXTERNAL_BROWSER $(basename "$CHROME")"
+          "$CHROME" --version | sed 's/^/DCC_EXTERNAL_BROWSER_VERSION /'
+
+          ROOT="$RUNNER_TEMP/dcc-external-probe"
+          PROFILE="$ROOT/profile"
+          LOG="$ROOT/chrome.log"
+          XLOG="$ROOT/xvfb.log"
+          mkdir -p "$PROFILE"
+          chmod 700 "$ROOT" "$PROFILE"
+
+          display=""
+          for n in 91 92 93 94 95 96 97 98 99; do
+            if [ ! -e "/tmp/.X$n-lock" ] && [ ! -e "/tmp/.X11-unix/X$n" ]; then
+              display="$n"
+              break
+            fi
+          done
+          [ -n "$display" ] || { echo "DCC_EXTERNAL_PROBE_FAIL NO_FREE_DISPLAY"; exit 2; }
+
+          Xvfb ":$display" -screen 0 1280x800x24 -nolisten tcp >"$XLOG" 2>&1 &
+          xpid=$!
+
+          cleanup() {
+            if [ -n "${chrome_pgid:-}" ] && [ "$chrome_pgid" -gt 1 ] 2>/dev/null; then
+              kill -TERM -- "-$chrome_pgid" 2>/dev/null || true
+              sleep 1
+              kill -KILL -- "-$chrome_pgid" 2>/dev/null || true
+            elif [ -n "${chrome_pid:-}" ]; then
+              kill "$chrome_pid" 2>/dev/null || true
+            fi
+            kill "$xpid" 2>/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+
+          sleep 2
+          kill -0 "$xpid" 2>/dev/null || {
+            echo "DCC_EXTERNAL_PROBE_FAIL XVFB_EXITED"
+            tail -n 40 "$XLOG" || true
+            exit 2
+          }
+
+          export DISPLAY=":$display"
+
+          setsid "$CHROME" \
+            --user-data-dir="$PROFILE" \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-background-networking \
+            --disable-component-update \
+            --disable-sync \
+            --disable-features=Translate,MediaRouter \
+            about:blank \
+            >"$LOG" 2>&1 &
+
+          chrome_pid=$!
+          chrome_pgid="$(ps -o pgid= -p "$chrome_pid" | tr -d '[:space:]')"
+          chrome_sid="$(ps -o sid= -p "$chrome_pid" | tr -d '[:space:]')"
+
+          case "$chrome_pgid" in ''|*[!0-9]*) echo "DCC_EXTERNAL_PROBE_FAIL PGID_UNKNOWN"; exit 2;; esac
+          case "$chrome_sid" in ''|*[!0-9]*) echo "DCC_EXTERNAL_PROBE_FAIL SID_UNKNOWN"; exit 2;; esac
+
+          echo "DCC_EXTERNAL_PROCESS_BOUNDARY pgid=$chrome_pgid sid=$chrome_sid"
+          sleep 8
+
+          SELF_UID="$(id -u)"
+          total=0
+          good_seccomp=0
+          good_nnp=0
+          bad=0
+
+          for status_path in /proc/[0-9]*/status; do
+            [ -r "$status_path" ] || continue
+            pid="${status_path#/proc/}"
+            pid="${pid%/status}"
+
+            uid="$(awk '/^Uid:/{print $2; exit}' "$status_path" 2>/dev/null || true)"
+            [ "$uid" = "$SELF_UID" ] || continue
+
+            proc_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+            proc_sid="$(ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+            [ "$proc_pgid" = "$chrome_pgid" ] || continue
+            [ "$proc_sid" = "$chrome_sid" ] || continue
+
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+            case "$cmdline" in *"--type=renderer"*) ;; *) continue ;; esac
+
+            seccomp="$(awk '/^Seccomp:/{print $2; exit}' "$status_path" 2>/dev/null || true)"
+            nnp="$(awk '/^NoNewPrivs:/{print $2; exit}' "$status_path" 2>/dev/null || true)"
+            filters="$(awk '/^Seccomp_filters:/{print $2; exit}' "$status_path" 2>/dev/null || true)"
+
+            total=$((total + 1))
+            [ "$seccomp" = "2" ] && good_seccomp=$((good_seccomp + 1))
+            [ "$nnp" = "1" ] && good_nnp=$((good_nnp + 1))
+            if [ "$seccomp" != "2" ] || [ "$nnp" != "1" ]; then
+              bad=$((bad + 1))
+            fi
+
+            echo "DCC_EXTERNAL_RENDERER_SANDBOX pid=$pid seccomp=${seccomp:-UNKNOWN} filters=${filters:-UNKNOWN} no_new_privs=${nnp:-UNKNOWN}"
+          done
+
+          echo "DCC_EXTERNAL_SANDBOX_SUMMARY renderers=$total seccomp_ok=$good_seccomp no_new_privs_ok=$good_nnp bad=$bad"
+
+          if [ "$total" -eq 0 ]; then
+            echo "DCC_EXTERNAL_BROWSER_LOG_BEGIN"
+            grep -aE 'sandbox|Sandbox|FATAL|ERROR|Error|error|namespace|DISPLAY|zygote' "$LOG" | tail -n 80 || true
+            echo "DCC_EXTERNAL_BROWSER_LOG_END"
+            echo "DCC_EXTERNAL_PROBE_FAIL NO_RENDERER"
+            exit 3
+          fi
+
+          [ "$bad" -eq 0 ] || { echo "DCC_EXTERNAL_PROBE_FAIL SANDBOX_INCOMPLETE"; exit 3; }
+          [ "$good_seccomp" -eq "$total" ] || { echo "DCC_EXTERNAL_PROBE_FAIL SECCOMP_INCOMPLETE"; exit 3; }
+          [ "$good_nnp" -eq "$total" ] || { echo "DCC_EXTERNAL_PROBE_FAIL NNP_INCOMPLETE"; exit 3; }
+
+          echo "DCC_EXTERNAL_SANDBOX_CAPABILITY result=PASS browser=chrome target=about:blank headful=YES seccomp=FILTERED no_new_privs=YES"
+          echo "DCC_EXTERNAL_PROBE_COMPLETE"

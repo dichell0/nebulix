@@ -15,12 +15,59 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   neutral-browser-sandbox:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Prove secretless GitHub OIDC identity
+        shell: bash
+        env:
+          DCC_OIDC_AUDIENCE: https://dev.askandgo.com.ua/dcc-external-executor
+        run: |
+          set -euo pipefail
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?}"
+
+          response="$(curl -fsS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${DCC_OIDC_AUDIENCE}")"
+
+          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])' <<<"$response")"
+          test -n "$token"
+
+          TOKEN="$token" python3 <<'PY'
+          import base64, json, os
+          token = os.environ["TOKEN"]
+          parts = token.split(".")
+          if len(parts) != 3:
+              raise SystemExit("DCC_EXTERNAL_OIDC_FAIL JWT_SHAPE")
+          raw = parts[1] + "=" * (-len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(raw.encode()))
+          safe = {
+              key: claims.get(key)
+              for key in (
+                  "iss", "aud", "repository", "repository_owner",
+                  "repository_visibility", "event_name", "ref",
+                  "job_workflow_ref", "actor_id", "run_id", "run_attempt"
+              )
+          }
+          print("DCC_EXTERNAL_OIDC_CLAIMS " + json.dumps(safe, sort_keys=True, separators=(",", ":")))
+          expected = {
+              "iss": "https://token.actions.githubusercontent.com",
+              "aud": "https://dev.askandgo.com.ua/dcc-external-executor",
+              "repository": "dichell0/nebulix",
+              "repository_owner": "dichell0",
+              "repository_visibility": "public",
+          }
+          for key, value in expected.items():
+              if claims.get(key) != value:
+                  raise SystemExit(f"DCC_EXTERNAL_OIDC_FAIL {key.upper()}_MISMATCH")
+          print("DCC_EXTERNAL_OIDC_CAPABILITY result=PASS secretless=YES")
+          PY
+
       - name: Prove native Chrome sandbox on ephemeral hosted runner
         shell: bash
         run: |
